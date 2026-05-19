@@ -289,13 +289,7 @@ func unmarshalAuthRequestResponse(statusCode int, body []byte, debug bool) (outp
 	case http.StatusOK, http.StatusNotModified:
 		err = json.Unmarshal(body, &output)
 	case http.StatusNotFound, http.StatusBadRequest, http.StatusUnauthorized:
-		err = json.Unmarshal(body, &errResp)
-		if err == nil {
-			log.DebugPrint(debug, fmt.Sprintf("status %d %+v", statusCode, errResp), common.MaxDebugChars)
-			if statusCode == http.StatusUnauthorized {
-				log.DebugPrint(debug, fmt.Sprintf("parsed %+v\n", errResp), common.MaxDebugChars)
-			}
-		}
+		errResp, err = handleAuthErrorResponse(statusCode, body, debug)
 	case http.StatusForbidden:
 		err = fmt.Errorf("server returned 403 Forbidden response")
 	default:
@@ -303,6 +297,42 @@ func unmarshalAuthRequestResponse(statusCode int, body []byte, debug bool) (outp
 	}
 
 	return
+}
+
+// handleAuthErrorResponse parses a 4xx response from /v2/login-params and
+// returns either a non-nil err carrying the server's message, or an
+// MFA-bearing errResp with err nil (the soft-failure path the caller relies on
+// to prompt for an MFA token and retry).
+func handleAuthErrorResponse(statusCode int, body []byte, debug bool) (errResp ErrorResponse, err error) {
+	if uerr := json.Unmarshal(body, &errResp); uerr != nil {
+		return errResp, fmt.Errorf("HTTP %d: %s", statusCode, body)
+	}
+	log.DebugPrint(debug, fmt.Sprintf("status %d %+v", statusCode, errResp), common.MaxDebugChars)
+	if statusCode == http.StatusUnauthorized {
+		log.DebugPrint(debug, fmt.Sprintf("parsed %+v\n", errResp), common.MaxDebugChars)
+	}
+	// MFA challenges are delivered as 4xx responses with mfa_key set in the
+	// error payload. Treat those as a soft signal so the caller can prompt
+	// for the MFA token and retry; everything else is a real error.
+	if errResp.Data.Error.Payload.MFAKey != "" {
+		return errResp, nil
+	}
+	if msg := errResp.Data.Error.Message; msg != "" {
+		return errResp, fmt.Errorf("HTTP %d: %s", statusCode, msg)
+	}
+	// Some 4xx responses (e.g. API gateway rejections) use a top-level
+	// {"error":{"message":"..."}} envelope instead of the auth service's
+	// {"data":{"error":{"message":"..."}}}. Try that shape before falling
+	// back to the raw body.
+	var gatewayErr struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &gatewayErr) == nil && gatewayErr.Error.Message != "" {
+		return errResp, fmt.Errorf("HTTP %d: %s", statusCode, gatewayErr.Error.Message)
+	}
+	return errResp, fmt.Errorf("HTTP %d: %s", statusCode, body)
 }
 
 // UnmarshalAuthRequestResponseForTest exposes unmarshalAuthRequestResponse for testing.
